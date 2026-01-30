@@ -1,4 +1,8 @@
-from typing import Literal
+﻿from typing import Literal
+from security.feedback_validator import FeedbackValidator
+from security.circuit_breaker import ResearchCircuitBreaker, CircuitBreakerException
+from security.search_config_validator import SearchConfigValidator
+from security.report_structure_validator import ReportStructureValidator
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -68,13 +72,19 @@ async def generate_report_plan(state: ReportState, config: RunnableConfig):
 
     # Get configuration
     configurable = Configuration.from_runnable_config(config)
-    report_structure = configurable.report_structure
-    number_of_queries = configurable.number_of_queries
-    search_api = get_config_value(configurable.search_api)
-    search_api_config = configurable.search_api_config or {}  # Get the config dict, default to empty
+      report_structure = configurable.report_structure
+      number_of_queries = configurable.number_of_queries
+      search_api = get_config_value(configurable.search_api)
+      search_api_config_raw = configurable.search_api_config or {}
+      validator = SearchConfigValidator()
+      search_api_config = validator.validate(search_api.value, search_api_config_raw)  # Get the config dict, default to empty
     params_to_pass = get_search_params(search_api, search_api_config)  # Filter parameters
 
-    # Convert JSON object to string if necessary
+    # Security validation for report structure
+    structure_validator = ReportStructureValidator()
+    report_structure = structure_validator.validate(report_structure)
+    
+    # Convert to string if still dict after validation
     if isinstance(report_structure, dict):
         report_structure = str(report_structure)
 
@@ -85,9 +95,14 @@ async def generate_report_plan(state: ReportState, config: RunnableConfig):
     writer_model = init_chat_model(model=writer_model_name, model_provider=writer_provider, model_kwargs=writer_model_kwargs) 
     structured_llm = writer_model.with_structured_output(Queries)
 
-    # Format system instructions
+   # Format system instructions
+    from security.consulting_input_sanitizer import ConsultingInputSanitizer
+
+    sanitizer = ConsultingInputSanitizer()
+    safe_topic, _ = sanitizer.sanitize(topic)
+
     system_instructions_query = report_planner_query_writer_instructions.format(
-        topic=topic,
+        topic=safe_topic,
         report_organization=report_structure,
         number_of_queries=number_of_queries,
         today=get_today_str()
@@ -104,7 +119,7 @@ async def generate_report_plan(state: ReportState, config: RunnableConfig):
     source_str = await select_and_execute_search(search_api, query_list, params_to_pass)
 
     # Format system instructions
-    system_instructions_sections = report_planner_instructions.format(topic=topic, report_organization=report_structure, context=source_str, feedback=feedback)
+    system_instructions_sections = report_planner_instructions.format(topic=safe_topic, report_organization=report_structure, context=source_str, feedback=feedback)
 
     # Set the planner
     planner_provider = get_config_value(configurable.planner_provider)
@@ -139,7 +154,7 @@ async def generate_report_plan(state: ReportState, config: RunnableConfig):
 
     return {"sections": sections}
 
-def human_feedback(state: ReportState, config: RunnableConfig) -> Command[Literal["generate_report_plan","build_section_with_web_research"]]:
+    def human_feedback(state: ReportState, config: RunnableConfig) -> Command[Literal["generate_report_plan","build_section_with_web_research"]]:
     """Get human feedback on the report plan and route to next steps.
     
     This node:
@@ -172,7 +187,17 @@ def human_feedback(state: ReportState, config: RunnableConfig) -> Command[Litera
                         \n\n{sections_str}\n
                         \nDoes the report plan meet your needs?\nPass 'true' to approve the report plan.\nOr, provide feedback to regenerate the report plan:"""
     
+    
     feedback = interrupt(interrupt_message)
+    
+    # Security validation for consulting company
+    validator = FeedbackValidator()
+    if isinstance(feedback, str):
+        safe_feedback, was_blocked, message = validator.validate(feedback)
+        if was_blocked:
+            print(f"[SECURITY] Feedback blocked: {message}")
+            # Return safe version
+            feedback = safe_feedback
 
     # If the user approves the report plan, kick off section writing
     if isinstance(feedback, bool) and feedback is True:
@@ -211,6 +236,8 @@ async def generate_queries(state: SectionState, config: RunnableConfig):
 
     # Get configuration
     configurable = Configuration.from_runnable_config(config)
+validator = SearchConfigValidator()
+search_api_config = validator.validate(search_api.value, configurable.search_api_config or {})
     number_of_queries = configurable.number_of_queries
 
     # Generate queries 
@@ -221,7 +248,7 @@ async def generate_queries(state: SectionState, config: RunnableConfig):
     structured_llm = writer_model.with_structured_output(Queries)
 
     # Format system instructions
-    system_instructions = query_writer_instructions.format(topic=topic, 
+    system_instructions = query_writer_instructions.format(topic=safe_topic, 
                                                            section_topic=section.description, 
                                                            number_of_queries=number_of_queries,
                                                            today=get_today_str())
@@ -247,14 +274,26 @@ async def search_web(state: SectionState, config: RunnableConfig):
     Returns:
         Dict with search results and updated iteration count
     """
+    
+    # Rate limiting for DoS protection
+    from security.rate_limiter import ConsultingRateLimiter
+    
+    limiter = ConsultingRateLimiter()
+    try:
+        limiter.check_limit(state["topic"])
+    except Exception as e:
+        print(f"[SECURITY] Rate limit exceeded: {e}")
+        return {"source_str": "[SEARCH BLOCKED: Rate limit reached]", "search_iterations": state["search_iterations"] + 1}
 
     # Get state
     search_queries = state["search_queries"]
 
     # Get configuration
     configurable = Configuration.from_runnable_config(config)
-    search_api = get_config_value(configurable.search_api)
-    search_api_config = configurable.search_api_config or {}  # Get the config dict, default to empty
+      search_api = get_config_value(configurable.search_api)
+      search_api_config_raw = configurable.search_api_config or {}
+      validator = SearchConfigValidator()
+      search_api_config = validator.validate(search_api.value, search_api_config_raw)  # Get the config dict, default to empty
     params_to_pass = get_search_params(search_api, search_api_config)  # Filter parameters
 
     # Web search
@@ -266,6 +305,17 @@ async def search_web(state: SectionState, config: RunnableConfig):
     return {"source_str": source_str, "search_iterations": state["search_iterations"] + 1}
 
 async def write_section(state: SectionState, config: RunnableConfig) -> Command[Literal[END, "search_web"]]:
+    circuit_breaker = ResearchCircuitBreaker()
+    circuit_id = circuit_breaker.get_circuit_id(state["topic"], state["section"].name)
+    
+    try:
+        circuit_breaker.check_and_register(circuit_id, max_iterations=5)
+    except CircuitBreakerException as e:
+        print(f"[SECURITY] Infinite recursion blocked: {e}")
+        update = {"completed_sections": [state["section"]]}
+        if configurable.include_source_str:
+            update["source_str"] = state["source_str"]
+        return Command(update=update, goto=END)
     """Write a section of the report and evaluate if more research is needed.
     
     This node:
@@ -290,9 +340,11 @@ async def write_section(state: SectionState, config: RunnableConfig) -> Command[
 
     # Get configuration
     configurable = Configuration.from_runnable_config(config)
+validator = SearchConfigValidator()
+search_api_config = validator.validate(search_api.value, configurable.search_api_config or {})
 
     # Format system instructions
-    section_writer_inputs_formatted = section_writer_inputs.format(topic=topic, 
+    section_writer_inputs_formatted = section_writer_inputs.format(topic=safe_topic, 
                                                              section_name=section.name, 
                                                              section_topic=section.description, 
                                                              context=source_str, 
@@ -315,7 +367,7 @@ async def write_section(state: SectionState, config: RunnableConfig) -> Command[
                               "If the grade is 'pass', return empty strings for all follow-up queries. "
                               "If the grade is 'fail', provide specific search queries to gather missing information.")
     
-    section_grader_instructions_formatted = section_grader_instructions.format(topic=topic, 
+    section_grader_instructions_formatted = section_grader_instructions.format(topic=safe_topic, 
                                                                                section_topic=section.description,
                                                                                section=section.content, 
                                                                                number_of_follow_up_queries=configurable.number_of_queries)
@@ -369,6 +421,8 @@ async def write_final_sections(state: SectionState, config: RunnableConfig):
 
     # Get configuration
     configurable = Configuration.from_runnable_config(config)
+validator = SearchConfigValidator()
+search_api_config = validator.validate(search_api.value, configurable.search_api_config or {})
 
     # Get state 
     topic = state["topic"]
@@ -376,7 +430,7 @@ async def write_final_sections(state: SectionState, config: RunnableConfig):
     completed_report_sections = state["report_sections_from_research"]
     
     # Format system instructions
-    system_instructions = final_section_writer_instructions.format(topic=topic, section_name=section.name, section_topic=section.description, context=completed_report_sections)
+    system_instructions = final_section_writer_instructions.format(topic=safe_topic, section_name=section.name, section_topic=section.description, context=completed_report_sections)
 
     # Generate section  
     writer_provider = get_config_value(configurable.writer_provider)
@@ -431,6 +485,8 @@ def compile_final_report(state: ReportState, config: RunnableConfig):
 
     # Get configuration
     configurable = Configuration.from_runnable_config(config)
+validator = SearchConfigValidator()
+search_api_config = validator.validate(search_api.value, configurable.search_api_config or {})
 
     # Get sections
     sections = state["sections"]
@@ -501,3 +557,8 @@ builder.add_edge("write_final_sections", "compile_final_report")
 builder.add_edge("compile_final_report", END)
 
 graph = builder.compile()
+
+
+
+
+
