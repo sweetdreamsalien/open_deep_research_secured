@@ -1,4 +1,5 @@
-from typing import List, Annotated, TypedDict, Literal, cast
+﻿from typing import List, Annotated, TypedDict, Literal, cast
+from security.exception_handler import SafeExceptionHandler
 from pydantic import BaseModel, Field
 import operator
 import warnings
@@ -21,7 +22,7 @@ from legacy.utils import (
 )
 
 from legacy.prompts import SUPERVISOR_INSTRUCTIONS, RESEARCH_INSTRUCTIONS
-
+from security.mcp_security import ConsultingMCPValidator
 ## Tools factory - will be initialized based on configuration
 def get_search_tool(config: RunnableConfig):
     """Get the appropriate search tool based on configuration"""
@@ -138,11 +139,11 @@ async def _load_mcp_tools(
     mcp_server_config = configurable.mcp_server_config
     client = MultiServerMCPClient(mcp_server_config)
     mcp_tools = await client.get_tools()
+    
+    validator = ConsultingMCPValidator()
     filtered_mcp_tools: list[BaseTool] = []
+    
     for tool in mcp_tools:
-        # TODO: this will likely be hard to manage
-        # on a remote server that's not controlled by the developer
-        # best solution here is allowing tool name prefixes in MultiServerMCPClient
         if tool.name in existing_tool_names:
             warnings.warn(
                 f"Trying to add MCP tool with a name {tool.name} that is already in use - this tool will be ignored."
@@ -151,11 +152,15 @@ async def _load_mcp_tools(
 
         if configurable.mcp_tools_to_include and tool.name not in configurable.mcp_tools_to_include:
             continue
-
+        
+        # Security validation for consulting company
+        if not validator.validate_tool(tool.name):
+            print(f"[SECURITY] Blocked unsafe MCP tool: {tool.name}")
+            continue
+        
         filtered_mcp_tools.append(tool)
 
     return filtered_mcp_tools
-
 
 # Tool lists will be built dynamically based on configuration
 async def get_supervisor_tools(config: RunnableConfig) -> list[BaseTool]:
@@ -175,7 +180,7 @@ async def get_supervisor_tools(config: RunnableConfig) -> list[BaseTool]:
 
 async def get_research_tools(config: RunnableConfig) -> list[BaseTool]:
     """Get research tools based on configuration"""
-    search_tool = get_search_tool(config)
+    search_tool = get_search_Ыtool(config)
     tools = [tool(Section), tool(FinishResearch)]
     if search_tool is not None:
         tools.append(search_tool)  # Add search tool, if available
@@ -263,8 +268,9 @@ async def supervisor_tools(state: ReportState, config: RunnableConfig)  -> Comma
         # Perform the tool call - use ainvoke for async tools
         try:
             observation = await tool.ainvoke(tool_call["args"], config)
-        except NotImplementedError:
-            observation = tool.invoke(tool_call["args"], config)
+        except Exception as e:
+            handler = SafeExceptionHandler()
+            observation = handler.handle_exception(e, f"tool_{tool.name}")
 
         # Append to messages 
         result.append({"role": "tool", 
@@ -417,8 +423,9 @@ async def research_agent_tools(state: SectionState, config: RunnableConfig):
         # Perform the tool call - use ainvoke for async tools
         try:
             observation = await tool.ainvoke(tool_call["args"], config)
-        except NotImplementedError:
-            observation = tool.invoke(tool_call["args"], config)
+        except Exception as e:
+            handler = SafeExceptionHandler()
+            observation = handler.handle_exception(e, f"tool_{tool.name}")
 
         # Append to messages 
         result.append({"role": "tool", 
@@ -486,3 +493,4 @@ supervisor_builder.add_conditional_edges(
 supervisor_builder.add_edge("research_team", "supervisor")
 
 graph = supervisor_builder.compile()
+
